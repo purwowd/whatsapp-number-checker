@@ -1,0 +1,10 @@
+# External packages folder
+.idea/
+vendor/
+out/
+
+docs/cov.json
+docs/coverage.html
+.DS_Store
+examplestore.db
+qrcode.png
