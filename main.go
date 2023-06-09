@@ -3,15 +3,17 @@ package main
 import (
 	"context"
 	"fmt"
+	"go.mau.fi/whatsmeow/types/events"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 
+	"github.com/gin-gonic/gin"
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/skip2/go-qrcode"
+	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store/sqlstore"
-	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
@@ -22,66 +24,82 @@ func eventHandler(evt interface{}) {
 	}
 }
 
+func generateQRCode(client *whatsmeow.Client) (string, error) {
+	if client.IsLoggedIn() {
+		return "", fmt.Errorf("session active, please logout")
+	}
+
+	qrChan, _ := client.GetQRChannel(context.Background())
+	err := client.Connect()
+	if err != nil {
+		return "", err
+	}
+
+	for evt := range qrChan {
+		if evt.Event == "code" {
+			return evt.Code, nil
+		}
+	}
+
+	return "", fmt.Errorf("QR code generation failed")
+}
+
 func main() {
 	dbLog := waLog.Stdout("Database", "DEBUG", true)
-	// Make sure you add appropriate DB connector imports, e.g. github.com/mattn/go-sqlite3 for SQLite
 	container, err := sqlstore.New("sqlite3", "file:examplestore.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		panic(err)
 	}
-	// If you want multiple sessions, remember their JIDs and use .GetDevice(jid) or .GetAllDevices() instead.
+
 	deviceStore, err := container.GetFirstDevice()
 	if err != nil {
 		panic(err)
 	}
+
 	clientLog := waLog.Stdout("Client", "DEBUG", true)
 	client := whatsmeow.NewClient(deviceStore, clientLog)
 	client.AddEventHandler(eventHandler)
 
-	if client.Store.ID == nil {
-		// No ID stored, new login
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			panic(err)
-		}
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				// Generate the QR code
-				qrCode, err := qrcode.New(evt.Code, qrcode.Medium)
-				if err != nil {
-					fmt.Println("Failed to generate QR code:", err)
-					continue
-				}
-				// Get the byte slice representation of the QR code image
-				qrImageBytes, err := qrCode.PNG(int(qrcode.Medium))
-				if err != nil {
-					fmt.Println("Failed to encode QR code as PNG:", err)
-					continue
-				}
-				// Save the QR code image to a file
-				err = os.WriteFile("qrcode.png", qrImageBytes, 0644)
-				if err != nil {
-					fmt.Println("Failed to save QR code:", err)
-					return
-				}
-				fmt.Println("QR code saved as qrcode.png")
-			} else {
-				fmt.Println("Login event:", evt.Event)
-			}
-		}
-	} else {
-		// Already logged in, just connect
-		err = client.Connect()
-		if err != nil {
-			panic(err)
-		}
-	}
+	router := gin.Default()
 
-	// Listen to Ctrl+C (you can also do something else that prevents the program from exiting)
+	router.GET("/qrcode", func(c *gin.Context) {
+		qrCode, err := generateQRCode(client)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		qrterminal.GenerateHalfBlock(qrCode, qrterminal.L, os.Stdout)
+		c.String(http.StatusOK, qrCode)
+	})
+
+	router.POST("/check-whatsapp", func(c *gin.Context) {
+		var request struct {
+			Phones []string `json:"phones"`
+		}
+		if err := c.ShouldBindJSON(&request); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+			return
+		}
+
+		response, err := client.IsOnWhatsApp(request.Phones)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check WhatsApp numbers"})
+			return
+		}
+
+		c.JSON(http.StatusOK, response)
+	})
+
 	c := make(chan os.Signal)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	<-c
+	go func() {
+		<-c
+		client.Disconnect()
+		os.Exit(0)
+	}()
 
-	client.Disconnect()
+	if err := router.Run(":8888"); err != nil {
+		panic(err)
+	}
 }
